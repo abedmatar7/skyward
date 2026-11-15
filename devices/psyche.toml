@@ -1,0 +1,26 @@
+cat << 'EOF' > devices/psyche.toml
+[device]
+codename = "psyche"
+brand = "Xiaomi"
+model = "Xiaomi 12X"
+ab = true
+soc = { hans = "骁龙®870移动平台", hant = "Snapdragon® 870 行動平台", en = "Snapdragon® 870 5G Mobile Platform" }
+os_version_prop = "ro.mi.os.version.incremental"
+
+[display]
+width = 1080
+height = 2400
+density = 420
+
+[modules]
+sources = ["vendor_boot", "vendor_dlkm", "vendor"]
+load = ["fts_touch_spi"]
+
+[update]
+server = "https://update.miui.com/updates/miotaV3.php"
+
+[stock]
+version = "OS3.0.309.0.WMCCNXM"
+package = "https://bkt-sgp-miui-ota-update-alisgp.oss-ap-southeast-1.aliyuncs.com/OS3.0.309.0.WMCCNXM/fuxi-ota_full-OS3.0.309.0.WMCCNXM-user-16.0-4729900895.zip"
+recovery = "f3749538243783db7393c3bc4cb72bb4ca6a046e0ceb3a6c779bf6fc4eef610e"
+EOF
