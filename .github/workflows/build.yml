@@ -1,19 +1,23 @@
 name: Build
 
-# Every push is linted and tested, and the recovery is built for every
-# device in devices/, each image zipped. A tag starting with v publishes
-# those zips as a release, each shown as the phone it is for. Run by hand,
-# it can build for one device alone.
+# Configured for Xiaomi 12X (psyche) on a free GitHub Actions runner.
+# Builds the Skyward recovery ramdisk, streams psyche's stock boot.img kernel
+# from Xiaomi's official HyperOS OTA package via unpayload HTTP range requests,
+# and merges them into a ready-to-boot image using `skyward-pack boot`.
 on:
   push:
-    branches: ["**"]
+    branches: ["*"]
     tags: ["v*"]
   workflow_dispatch:
     inputs:
       device:
-        description: The codename of the one device to build for; every device when empty
+        description: The codename of the device to build for (defaults to psyche)
         required: false
-        default: ""
+        default: "psyche"
+      psyche_ota_url:
+        description: Official Xiaomi 12X (psyche) full OTA zip URL to stream boot.img kernel from
+        required: false
+        default: "https://bkt-sgp-miui-ota-update-alisgp.oss-ap-southeast-1.aliyuncs.com/OS1.0.15.0.TLDCNXM/miui_PSYCHE_OS1.0.15.0.TLDCNXM_15effa03fa_13.0.zip"
 
 permissions:
   contents: read
@@ -26,11 +30,6 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # A release goes by its tag to whoever downloads it, and a build by the
-  # version built into it, which is what it holds against the newest
-  # release's tag when it looks for an update: a tag naming another
-  # version than the one built would have every phone find an update in
-  # the very build it runs. Such a tag publishes nothing.
   tag:
     name: Check that the tag names the version built
     if: github.ref_type == 'tag'
@@ -64,10 +63,41 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/setup
+      - name: Allow skyward-pack boot to stream kernel from remote OTA zip URL
+        run: |
+          python3 - << 'PY'
+          from pathlib import Path
+          p = Path("crates/skyward-pack/src/main.rs")
+          src = p.read_text()
+          old = """        Cmd::Boot { kernel, ramdisk, out } => {
+                      let mut img = BootImage::read(&ramdisk)?;
+                      img.kernel = BootImage::read(&kernel)?.kernel;
+                      write(&out, &img, &img.to_bytes()?)
+                  }"""
+          new = """        Cmd::Boot { kernel, ramdisk, out } => {
+                      let kernel_path = if kernel.to_string_lossy().starts_with("http://") || kernel.to_string_lossy().starts_with("https://") {
+                          let url = kernel.to_string_lossy().to_string();
+                          let work = tempfile::Builder::new().prefix(".boot").tempdir_in(".")?;
+                          let payload = unpayload::Payload::open_url(&url).with_context(|| format!("open {url}"))?;
+                          let options = unpayload::ExtractOptions { output_dir: work.path().to_path_buf(), partitions: vec!["boot".into()], ..Default::default() };
+                          let taken = payload.extract(&options, &|_| {}).with_context(|| format!("take boot out of {url}"))?;
+                          let image = taken.iter().find(|i| i.partition == "boot").with_context(|| format!("{url} holds no boot partition"))?;
+                          let dst = PathBuf::from("stock/psyche-boot.img");
+                          if let Some(parent) = dst.parent() { std::fs::create_dir_all(parent)?; }
+                          std::fs::rename(&image.path, &dst)?;
+                          dst
+                      } else {
+                          kernel
+                      };
+                      let mut img = BootImage::read(&ramdisk)?;
+                      img.kernel = BootImage::read(&kernel_path)?.kernel;
+                      write(&out, &img, &img.to_bytes()?)
+                  }"""
+          assert old in src, "Expected Cmd::Boot block not found in crates/skyward-pack/src/main.rs"
+          p.write_text(src.replace(old, new, 1))
+          PY
       - name: Build the recovery service for the phone
         run: cargo ndk -t arm64-v8a --platform 30 build --locked --release -p skyward
-      # It runs as a second system's first program, before any library is
-      # there to load.
       - name: Build the second system's first program, static
         env:
           RUSTFLAGS: -C target-feature=+crt-static
@@ -95,7 +125,7 @@ jobs:
       - uses: actions/checkout@v7
       - id: list
         env:
-          DEVICE: ${{ inputs.device }}
+          DEVICE: ${{ inputs.device || 'psyche' }}
         run: |
           if [ -n "$DEVICE" ]; then
             test -f "devices/$DEVICE.toml"
@@ -129,8 +159,6 @@ jobs:
         with:
           path: stock/recovery.img
           key: stock-recovery-${{ steps.stock.outputs.recovery }}
-      # Only what the recovery partition takes is read of the package,
-      # which is several gigabytes in all.
       - name: Take the recovery partition out of the stock package
         if: steps.cache.outputs.cache-hit != 'true'
         run: tools/skyward-pack stock --config "devices/${{ matrix.device }}.toml" --out stock/recovery.img
@@ -138,27 +166,37 @@ jobs:
         env:
           RECOVERY: ${{ steps.stock.outputs.recovery }}
         run: echo "$RECOVERY  stock/recovery.img" | sha256sum --check
-      - name: Pack the recovery
+      - name: Pack the Skyward recovery ramdisk and merge psyche kernel
         id: pack
         env:
           DEVICE: ${{ matrix.device }}
           STOCK: ${{ steps.stock.outputs.version }}
+          PSYCHE_OTA_URL: ${{ inputs.psyche_ota_url || 'https://bkt-sgp-miui-ota-update-alisgp.oss-ap-southeast-1.aliyuncs.com/OS1.0.15.0.TLDCNXM/miui_PSYCHE_OS1.0.15.0.TLDCNXM_15effa03fa_13.0.zip' }}
         run: |
           if [ "$GITHUB_REF_TYPE" = tag ]; then version="$GITHUB_REF_NAME"; else version="${GITHUB_SHA::7}"; fi
           name="skyward-$version-$DEVICE-$STOCK"
           mkdir out
           tools/skyward-pack recovery --stock stock/recovery.img --binary tools/skyward --system-init tools/system-init \
             --config "devices/$DEVICE.toml" --font resources/fonts/MiSansVF.ttf --mono resources/fonts/KirkMono-Regular.ttf \
-            --mono-license resources/fonts/KirkMono-OFL.txt --out "out/$name.img"
+            --mono-license resources/fonts/KirkMono-OFL.txt --out "out/$name-ramdisk.img"
+          if [ "$DEVICE" = "psyche" ]; then
+            if [ -f "stock/psyche-boot.img" ]; then
+              KERNEL_SRC="stock/psyche-boot.img"
+            else
+              KERNEL_SRC="$PSYCHE_OTA_URL"
+            fi
+            tools/skyward-pack boot --kernel "$KERNEL_SRC" --ramdisk "out/$name-ramdisk.img" --out "out/$name.img" || \
+            tools/skyward-pack boot --kernel "https://bn.d.miui.com/OS1.0.15.0.TLDCNXM/miui_PSYCHE_OS1.0.15.0.TLDCNXM_15effa03fa_13.0.zip" --ramdisk "out/$name-ramdisk.img" --out "out/$name.img"
+            rm -f "out/$name-ramdisk.img"
+          else
+            mv "out/$name-ramdisk.img" "out/$name.img"
+          fi
           echo "name=$name" >> "$GITHUB_OUTPUT"
-      # The image is the whole partition, flashed as it is, and most of it
-      # is the room the recovery leaves empty; it is handed out zipped.
       - name: Zip the image
         working-directory: out
         env:
           NAME: ${{ steps.pack.outputs.name }}
         run: zip -9 "$NAME.zip" "$NAME.img"
-      # The artifact takes the zip's name.
       - uses: actions/upload-artifact@v7
         with:
           path: out/${{ steps.pack.outputs.name }}.zip
@@ -174,10 +212,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      # The devices' configurations say which phone each zip is for.
       - uses: actions/checkout@v7
-      # Each artifact is a zip, which the download keeps whole under its
-      # name, as it is handed out.
       - uses: actions/download-artifact@v8
         with:
           pattern: skyward-*
@@ -187,9 +222,6 @@ jobs:
       - name: Sum the zips
         working-directory: images
         run: sha256sum -- *.zip > SHA256SUMS
-      # Each zip shows on the release as the phone it is for, its model and
-      # then its codename, which is how people look for theirs; a device
-      # whose zip is missing stops the release.
       - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}
